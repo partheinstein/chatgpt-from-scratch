@@ -188,27 +188,107 @@ print(decode(generated[0].tolist()))
 # grad update using Adam
 optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
 batch_size = 32
-for steps in range(10000):
-    xb, yb = get_batch('train', batch_size, block_size)
-    logits, loss = m(xb, yb)
-    optimizer.zero_grad(set_to_none=True)
-    loss.backward()
-    # update gradients from backward prop
-    optimizer.step()
+eval_iters = 200
+eval_interval = 500
+max_iters = 5000
 
-# loss = 2.470 after 10K iterations
-print(loss.item())
+# tell pytorch that we won't be doing backwards prop so that it can manager mem better
+# because it doesn't have to store all the intermediate vars
+@torch.no_grad()
+def estimate_loss():
+    out = {}
+    # tell pytorch that the model is in eval mode so that dropout layers are not added
+    # just a good practice even though we don't have any dropout layers
+    # basically the mode tells what layers are to be added or not added
+    m.eval()
+    for split in ['train', 'val']:
+        losses = torch.zeros(eval_iters)
+        for k in range(eval_iters):
+            X, Y = get_batch('train', batch_size, block_size)
+            logits, loss = m(X, Y)
+            losses[k] = loss.item()
+        out[split] = losses.mean()
+    m.train()
+    return out
+
+def train():
+    for iter in range(max_iters):
+        # print loss every eval_interval to avoid printing too noisy loss outputs
+        if iter % eval_interval == 0:
+            losses = estimate_loss()
+            print(f"step {iter}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+
+
+        xb, yb = get_batch('train', batch_size, block_size)
+        logits, loss = m(xb, yb)
+        optimizer.zero_grad(set_to_none=True)
+        loss.backward()
+        # update gradients from backward prop
+        optimizer.step()
+    # loss = 2.470 after 10K iterations
+    print(loss.item())
 
 # let's see what the model outputs after training the model
-generated = m.generate(idx, 100)
-print(generated)
-print(decode(generated[0].tolist()))
-
+# train()
+# generated = m.generate(idx, 100)
+# print(generated)
+# print(decode(generated[0].tolist()))
 # GARI:
 # I youte y e nthinte, agr
 # BOWendanal YOLELala pe co rspf tosthinceeepot LT: my? therrndsais ith
 
 # looks somewhat better... but the tokens are not talking to each other
+# this is where self-attention comes in
+# recall B = batch/row, T = time/token/col, C = channel/value
+# for each batch we want to pass info from all the previous token to t (incl. t)
+# but from tokens t+1 and so on because they are future tokens
+# Andrej does an avg of the previous token as a first step but this is lossy
+# since the token positions are not used. i.e., maybe previous token should have
+# more weight to the current token etc but they may be other ways to pass the info
+# from prev tokens to this one. anyways lets do avg
 
+B, T, C = 4, 8, 2
+x = torch.randn(B, T, C)
+print(x.shape)
+print(x)
 
+# inefficient avg, without vectorization
+x_bag_words = torch.zeros((B, T, C))
+for b in range(B):
+    for t in range(T):
+        x_prev = x[b, :t+1]
+        x_bag_words[b, t] = torch.mean(x_prev, 0)
 
+print(x_bag_words[0])
+
+# efficient avg with vectorization
+x_bag_words2 = torch.zeros((B, T, C))
+# note that the triangular ones matrix is not B, T, C shape because we actually care about T/token
+# dimension when averaging. so it is a T, T square matrix
+# triangle = torch.tril(torch.ones(B, T, C))
+triangle = torch.tril(torch.ones(T, T))
+triangle = triangle / torch.sum(triangle, 1, keepdim=True) #TODO revise broadcasting
+print(triangle)
+# triangle is (T, T) dot prod with (B, T, C)
+# torch will add B dim so that it is (B, T, T) dot prod with (B, T, C)
+# so we end up with (B, T, C) shape
+x_bag_words2 = triangle @ x
+print(x_bag_words2[0])
+
+# assert both avg methods outputs the same
+print(torch.allclose(x_bag_words, x_bag_words2))
+
+        
+# another way to get the mean of the tensors/tokens is to use softmax
+triangle = torch.tril(torch.ones(T,T))
+# these weights are initially zeros but they can been as 'affinity' that gets learnt with data
+# some tokens will bigger or lesser affinity and these weights will learn how much affinity
+wei = torch.zeros((T, T))
+# can't affect the future tokens
+wei = wei.masked_fill(triangle == 0, float('-inf')) # replace 0 with -inf because softmax does e^-inf
+# norm
+wei = F.softmax(wei, dim=1)
+# dot prod - how much does the weights change the input tensors (linear transformation)
+x_bag_words3 = wei @ x
+print(x_bag_words3[0])
+print(torch.allclose(x_bag_words, x_bag_words3))
