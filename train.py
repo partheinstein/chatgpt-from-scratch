@@ -5,9 +5,13 @@ from torch.nn import functional as F
 batch_size = 64 
 block_size = 256
 eval_iters = 200
-n_embd = 384
+n_embd = 32
 n_head = 6
 dropout = 0.2
+eval_iters = 200
+eval_interval = 500
+max_iters = 5000
+learning_rate=1e-3
 
 with open('tiny-shakespeare.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -41,8 +45,7 @@ def get_batch(split, batch_size, block_size):
     # ix is the offset of the each batch in data
     # so if ix=879763, x = 46 which is char 'h'
     # y = data[879763+1] = 'e'
-    # so given char 'e' predict the next char which should be 'h'
-    # see below for more details
+    # so given char 'h' predict the next char which should be 'e'
     # x batch shape is 64, 256
     data = train_data if split == 'train' else val_data
     ix = torch.randint(high = len(data) - block_size,
@@ -55,84 +58,72 @@ x, y = get_batch('train', 1, 4)
 print(x)
 print(y)
 
-# x
-# tensor([[47, 60, 43, 56, 63,  8,  0,  0],
-#         [39, 52, 58,  1, 47, 52,  1, 51],
-#         [39, 58,  1, 54, 39, 56, 58,  1],
-#         [57,  1, 52, 53, 40, 50, 43,  1]])
-# y
-# tensor([[60, 43, 56, 63,  8,  0,  0, 31],
-#         [52, 58,  1, 47, 52,  1, 51, 63],
-#         [58,  1, 54, 39, 56, 58,  1, 41],
-#         [ 1, 52, 53, 40, 50, 43,  1, 55]])
-# given 47, predict 60
-# given 47,60, predict 43
-# given 47,60,43 predict 56
-# and so on
-# interesting that it only sees chars left to right
 
-# embedding example
-# https://pytorch.org/tutorials/beginner/nlp/word_embeddings_tutorial.html
-# create an embedding table of 3 tensors/vectors of size 3 dims, 3 by 3
-embedding = nn.Embedding(3, 3)
-# look up the embedding table by indices
-print(embedding(torch.IntTensor([0, 1, 1])))
-# tensor([[ 1.3636, -0.3836,  0.8032],
-#        [-0.1007,  0.9970,  0.2903],
-#        [-0.1007,  0.9970,  0.2903]], grad_fn=<EmbeddingBackward0>)
-# notice the indices passed should be in the range of the first dim of the embedding table
-# if embedding table is (65, 65), then the output of an indices tensor would be (64, 64)
-# but what do those values mean?
-# each token gets a 65 dimension vector, the values encode some attributes of the token
-# which we don't really know. If 2 tokens are have similar values in say dim/col 3, then
-# we can say that they are somehow related by attribute represented by dim/col 3.
-# but why 65?
-# because we want to encode each token's relationship with every other token and there are 65 tokens
-# suppose we have an embedding table like this
-# up to 10 indices (token vocab size) and 2 dims
-embedding = nn.Embedding(10, 2)
-# look up the embedding table by indices
-print("e2", embedding(torch.IntTensor([0, 4, 9])))
-# we get
-# e2 tensor([[-0.7861,  0.1931],
-#        [ 0.1851,  0.0749],
-#        [-1.2250, -0.2263]], grad_fn=<EmbeddingBackward0>)
-# this is not a rich embedding because there are only 2 relationships encoded
-# but we could have picked 100 dims, which is >> than the vocab size of 10 (in this example)
-# maybe it is too much given that there are only 10 possible tokens?
-# the pytorch article says " In NLP, it is almost always the case that your features are words"
-# so if there are 10 possible words/tokens then 10 dim embedding?
-# "We often want dense outputs from our neural networks, where the inputs are ∣V| dimensional,
-# where V is our vocabulary"
-# another hint is that we want dense outputs, so 100 dims for a vocab size would be a sparse vector
-# "but often the outputs are only a few dimensional (if we are only predicting a handful of labels,
-# for instance). How do we get from a massive dimensional space to a smaller dimensional space"
-# interestingly we are not trying to reduce the dimensions with vocabsize 65...
-# this could be because of the fact it is only 65, so no need to reduce the embedding dims
-# "central to the idea of deep learning is that the neural network learns representations of the
-# features, rather than requiring the programmer to design them herself. So why not just let the
-# word embeddings be parameters in our model, and then be updated during training?"
-# so initially the values are a bit random
-# but the values of the embeddings will be updated during training
+# Attention head
+class Head(nn.Module):
+    def __init__(self, head_size):
+        super().__init__()
+        self.key = nn.Linear(n_embd, head_size, bias=False)
+        self.query = nn.Linear(n_embd, head_size, bias=False)
+        self.value = nn.Linear(n_embd, head_size, bias=False)
+        self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
+    def forward(self, x):
+        B, T, C = x.shape
+        k = self.key(x)
+        q = self.query(x)
+        v = self.value(x)
+        wei = q @ k.transpose(-2, -1) * C**-0.5
+        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
+        wei = F.softmax(wei, dim=-1)
+        v = self.value(x)
+        out = wei @ v
+        return out
 
-# 4 batches of 8 tokens in each batch
-x, y = get_batch('train', 4, 8)
-# print(x)
-# tensor([[43,  1, 61, 46, 63,  1, 61, 43],
-#        [42, 56, 59, 45, 57,  1, 39, 56],
-#        [58,  6,  1, 19, 53, 42,  6,  0],
-#        [46, 39, 58,  1, 63, 53, 59,  1]])
+class MultiHeadAttention(nn.Module):
+    def __init__(self, num_heads, head_size):
+        super().__init__()
+        self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
+        self.projection = nn.Linear(n_embd, n_embd)
 
-# B, T, C
-# Batch, Time, Channel
-# 4, 8, 65
-# Batch = batch
-# Time/Token/block size = how many chars in each batch
-# Channel = number of possible values for each element in the vector
+    def forward(self, x):
+        # concat in the channel dimension
+        out = torch.cat([h(x) for h in self.heads], dim=-1)
+        out = self.projection(out)
+        return out
+
+class FeedForward(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_embd, 4 * n_embd),
+            nn.ReLU(),
+            nn.Linear(4 * n_embd, n_embd)
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+class Block(nn.Module):
+    def __init__(self, n_embd, n_head):
+        super().__init__()
+        # 4 attention blocks each producing 8 dim vector
+        # which are contactinated to produce 32 dim vector (which is the n_embd)
+        head_size = n_embd // n_head
+        self.sa_heads = MultiHeadAttention(n_head, head_size)
+        self.ffwd = FeedForward(n_embd)
+
+    def forward(self, x):
+        # residual or skip connections
+        # initially the sa_heads and ffwd paths contribute very little but overtime they take over
+        # has to do with backprop where the gradient are added 
+        # TODO understand more
+        x = x + self.sa_heads(x)
+        x = x + self.ffwd(x)
+        return x
 
 
-
+        
 # N-gram
 # given input sequence of words, we want to compute prob of w_i, given w_i-1, w_i-2... w_i-n
 # Andrej calls with Bigram, it is only looking at the previous word/token/char
@@ -140,10 +131,25 @@ class BigramLanguageModel(nn.Module):
 
     def __init__(self, vocab_size):
         super().__init__()
-        self.token_embedding_table = nn.Embedding(vocab_size, vocab_size)
+        self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
+        # position in the block is also referenced through this embedding 
+        self.position_embedding_table = nn.Embedding(block_size, n_embd)
+        self.blocks = nn.Sequential(
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4),
+            Block(n_embd, n_head=4)
+        )
+        self.lm_head = nn.Linear(n_embd, vocab_size)
 
     def forward(self, idx, targets):
-        logits = self.token_embedding_table(idx)
+        B, T = idx.shape
+        tok_emb = self.token_embedding_table(idx) # (B, T, n_embd)
+        # torch.arange returns an array of 0 to T-1
+        pos_emb = self.position_embedding_table(torch.arange(T))
+        # x not has has tokens identities (index) but also its position in the batch
+        x = tok_emb + pos_emb
+        x = self.blocks(x)
+        logits = self.lm_head(x) # (B, T, vocab_size)
 
         if targets is None:
             loss = None
@@ -158,6 +164,10 @@ class BigramLanguageModel(nn.Module):
 
     def generate(self, idx, max_new_tokens):
         for _ in range(max_new_tokens):
+            # crop to only the last blocks as we can only pass block size to forward()
+            # given that we embed the positon of the token in a block
+            # otherwise it would be out of bounds
+            idx = idx[:, -block_size:]
             logits, loss = self(idx, None)
             # drop T in B, T, C vector; i.e., select the next char from each batch
             logits = logits[:, -1, :]
@@ -167,6 +177,8 @@ class BigramLanguageModel(nn.Module):
         return idx
     
 
+# 4 batches of 8 tokens in each batch
+x, y = get_batch('train', 4, 8)
 
 m = BigramLanguageModel(vocab_size)
 logits, loss = m(x, y)
@@ -186,11 +198,7 @@ print(decode(generated[0].tolist()))
 
 # training loop to train the model to predict the next char better
 # grad update using Adam
-optimizer = torch.optim.AdamW(m.parameters(), lr=1e-3)
-batch_size = 32
-eval_iters = 200
-eval_interval = 500
-max_iters = 5000
+optimizer = torch.optim.AdamW(m.parameters(), lr=learning_rate)
 
 # tell pytorch that we won't be doing backwards prop so that it can manager mem better
 # because it doesn't have to store all the intermediate vars
@@ -229,10 +237,10 @@ def train():
     print(loss.item())
 
 # let's see what the model outputs after training the model
-# train()
-# generated = m.generate(idx, 100)
-# print(generated)
-# print(decode(generated[0].tolist()))
+train()
+generated = m.generate(idx, 100)
+#print(generated)
+print(decode(generated[0].tolist()))
 # GARI:
 # I youte y e nthinte, agr
 # BOWendanal YOLELala pe co rspf tosthinceeepot LT: my? therrndsais ith
@@ -246,49 +254,3 @@ def train():
 # since the token positions are not used. i.e., maybe previous token should have
 # more weight to the current token etc but they may be other ways to pass the info
 # from prev tokens to this one. anyways lets do avg
-
-B, T, C = 4, 8, 2
-x = torch.randn(B, T, C)
-print(x.shape)
-print(x)
-
-# inefficient avg, without vectorization
-x_bag_words = torch.zeros((B, T, C))
-for b in range(B):
-    for t in range(T):
-        x_prev = x[b, :t+1]
-        x_bag_words[b, t] = torch.mean(x_prev, 0)
-
-print(x_bag_words[0])
-
-# efficient avg with vectorization
-x_bag_words2 = torch.zeros((B, T, C))
-# note that the triangular ones matrix is not B, T, C shape because we actually care about T/token
-# dimension when averaging. so it is a T, T square matrix
-# triangle = torch.tril(torch.ones(B, T, C))
-triangle = torch.tril(torch.ones(T, T))
-triangle = triangle / torch.sum(triangle, 1, keepdim=True) #TODO revise broadcasting
-print(triangle)
-# triangle is (T, T) dot prod with (B, T, C)
-# torch will add B dim so that it is (B, T, T) dot prod with (B, T, C)
-# so we end up with (B, T, C) shape
-x_bag_words2 = triangle @ x
-print(x_bag_words2[0])
-
-# assert both avg methods outputs the same
-print(torch.allclose(x_bag_words, x_bag_words2))
-
-        
-# another way to get the mean of the tensors/tokens is to use softmax
-triangle = torch.tril(torch.ones(T,T))
-# these weights are initially zeros but they can been as 'affinity' that gets learnt with data
-# some tokens will bigger or lesser affinity and these weights will learn how much affinity
-wei = torch.zeros((T, T))
-# can't affect the future tokens
-wei = wei.masked_fill(triangle == 0, float('-inf')) # replace 0 with -inf because softmax does e^-inf
-# norm
-wei = F.softmax(wei, dim=1)
-# dot prod - how much does the weights change the input tensors (linear transformation)
-x_bag_words3 = wei @ x
-print(x_bag_words3[0])
-print(torch.allclose(x_bag_words, x_bag_words3))
