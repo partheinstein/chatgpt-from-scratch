@@ -12,6 +12,7 @@ eval_iters = 200
 eval_interval = 500
 max_iters = 5000
 learning_rate=1e-3
+dropout = 0.2
 
 with open('tiny-shakespeare.txt', 'r', encoding='utf-8') as f:
     text = f.read()
@@ -67,6 +68,7 @@ class Head(nn.Module):
         self.query = nn.Linear(n_embd, head_size, bias=False)
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         B, T, C = x.shape
@@ -76,6 +78,7 @@ class Head(nn.Module):
         wei = q @ k.transpose(-2, -1) * C**-0.5
         wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
         wei = F.softmax(wei, dim=-1)
+        wei = self.dropout(wei)
         v = self.value(x)
         out = wei @ v
         return out
@@ -85,11 +88,13 @@ class MultiHeadAttention(nn.Module):
         super().__init__()
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.projection = nn.Linear(n_embd, n_embd)
+        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x):
         # concat in the channel dimension
         out = torch.cat([h(x) for h in self.heads], dim=-1)
         out = self.projection(out)
+        out = self.dropout(out)
         return out
 
 class FeedForward(nn.Module):
@@ -98,7 +103,8 @@ class FeedForward(nn.Module):
         self.net = nn.Sequential(
             nn.Linear(n_embd, 4 * n_embd),
             nn.ReLU(),
-            nn.Linear(4 * n_embd, n_embd)
+            nn.Linear(4 * n_embd, n_embd),
+            nn.Dropout(dropout)
         )
 
     def forward(self, x):
@@ -112,14 +118,16 @@ class Block(nn.Module):
         head_size = n_embd // n_head
         self.sa_heads = MultiHeadAttention(n_head, head_size)
         self.ffwd = FeedForward(n_embd)
+        self.layernorm1 = nn.LayerNorm(n_embd)
+        self.layernorm2 = nn.LayerNorm(n_embd)
 
     def forward(self, x):
         # residual or skip connections
         # initially the sa_heads and ffwd paths contribute very little but overtime they take over
         # has to do with backprop where the gradient are added 
         # TODO understand more
-        x = x + self.sa_heads(x)
-        x = x + self.ffwd(x)
+        x = x + self.sa_heads(self.layernorm1(x))
+        x = x + self.ffwd(self.layernorm2(x))
         return x
 
 
@@ -137,7 +145,8 @@ class BigramLanguageModel(nn.Module):
         self.blocks = nn.Sequential(
             Block(n_embd, n_head=4),
             Block(n_embd, n_head=4),
-            Block(n_embd, n_head=4)
+            Block(n_embd, n_head=4),
+            nn.LayerNorm(n_embd)
         )
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
